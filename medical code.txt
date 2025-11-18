@@ -1,0 +1,232 @@
+# Single-cell ready code for Colab
+# Paste this whole cell into Google Colab and run.
+
+# 0) Install required packages
+import os, sys
+try:
+    import transformers, gradio
+except Exception:
+    # Install needed packages quietly
+    !pip install -q --upgrade pip
+    !pip install -q transformers[torch] accelerate gradio huggingface_hub sentencepiece
+    # blip model may use torchvision/pillow
+    !pip install -q ftfy regex torchvision pillow
+
+# 1) Imports and environment
+import torch
+from huggingface_hub import login as hf_login
+from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, M2M100ForConditionalGeneration, M2M100Tokenizer
+from transformers import BlipForConditionalGeneration, BlipProcessor
+import gradio as gr
+from PIL import Image
+import warnings
+warnings.filterwarnings("ignore")
+
+# 2) Ask for HF token (optional)
+print("If you have a Hugging Face token, paste it now (or press Enter to skip).")
+hf_token = input("HUGGINGFACEHUB_TOKEN: ").strip()
+if hf_token:
+    hf_login(hf_token)
+
+# 3) Device and dtype selection
+if torch.cuda.is_available():
+    device = 0
+    # prefer float16 for GPU to save memory where supported
+    torch_dtype = torch.float16
+    print("GPU detected. Will try to load models on GPU with float16 where supported.")
+else:
+    device = -1
+    torch_dtype = None
+    print("No GPU detected. Models will run on CPU (may be slow).")
+
+# 4) Load the text (chat) model: IBM Granite 3.3 2b instruct (attempt)
+CHAT_MODEL = "ibm/granite-3.3-2b-instruct"
+chat_tokenizer = None
+chat_model = None
+try:
+    print(f"Loading chat model: {CHAT_MODEL} ... (this may take a minute)")
+    # Try to load with pipeline for safety
+    chat_tokenizer = AutoTokenizer.from_pretrained(CHAT_MODEL, use_fast=True)
+    chat_model = AutoModelForCausalLM.from_pretrained(
+        CHAT_MODEL,
+        torch_dtype=torch_dtype if device != -1 else None,
+        device_map="auto" if device != -1 else None,
+        trust_remote_code=True
+    )
+    # text-generation pipeline
+    chat_pipe = pipeline("text-generation", model=chat_model, tokenizer=chat_tokenizer, device=device if device!=-1 else -1)
+    print("Chat model loaded.")
+except Exception as e:
+    print("Warning: couldn't fully load the requested chat model automatically. Falling back to a smaller local/text-generation pipeline for demonstration.")
+    print("Error:", e)
+    # Fallback to smaller model (public) so the cell runs even without access
+    FB_FALLBACK = "gpt2"
+    chat_tokenizer = AutoTokenizer.from_pretrained(FB_FALLBACK)
+    chat_model = AutoModelForCausalLM.from_pretrained(FB_FALLBACK)
+    chat_pipe = pipeline("text-generation", model=chat_model, tokenizer=chat_tokenizer, device=0 if torch.cuda.is_available() else -1)
+
+# 5) Load multilingual translation model (facebook/m2m100_418M)
+TRAN_MODEL = "facebook/m2m100_418M"
+print("Loading M2M100 multilingual translation model...")
+m2m_tokenizer = M2M100Tokenizer.from_pretrained(TRAN_MODEL)
+m2m_model = M2M100ForConditionalGeneration.from_pretrained(
+    TRAN_MODEL,
+    torch_dtype=torch_dtype if device != -1 else None,
+    device_map="auto" if device != -1 else None
+)
+print("Translation model loaded.")
+
+# 6) Load image captioning (BLIP) model
+IMG_MODEL = "Salesforce/blip-image-captioning-large"
+print("Loading BLIP image-captioning model...")
+blip_processor = BlipProcessor.from_pretrained(IMG_MODEL)
+blip_model = BlipForConditionalGeneration.from_pretrained(
+    IMG_MODEL,
+    torch_dtype=torch_dtype if device != -1 else None,
+    device_map="auto" if device != -1 else None
+)
+print("Image model loaded.")
+
+# 7) Prompt templates and safety / disclaimers
+SYSTEM_PROMPT = (
+    "You are an AI medical assistant designed to help clinicians and patients by providing informational guidance, "
+    "differential ideas, and suggestions for next steps. You must always: "
+    "1) include a clear medical disclaimer that you are not a substitute for professional medical advice; "
+    "2) avoid providing exact medication prescriptions or dosages without advising to consult a licensed professional; "
+    "3) flag any high-risk red flags and advise urgent care/911 if needed."
+)
+
+MEDICAL_DISCLAIMER = (
+    "Disclaimer: I am an AI model and not a licensed medical professional. The information I provide is for informational purposes only "
+    "and is NOT a substitute for professional medical advice, diagnosis, or treatment. Always consult a qualified healthcare provider "
+    "for medical decisions."
+)
+
+# 8) Chat function (maintains short history provided by Gradio state)
+def chat_with_assistant(user_message, chat_history):
+    """
+    user_message: str
+    chat_history: list of [user, assistant] pairs (Gradio state)
+    """
+    # Build conversation prompt: include system prompt, last few turns
+    full_prompt = SYSTEM_PROMPT + "\n\n"
+    # Append history
+    if chat_history:
+        for turn in chat_history[-6:]:  # keep last 6 turns
+            u, a = turn
+            full_prompt += f"User: {u}\nAssistant: {a}\n"
+    # Append new user input
+    full_prompt += f"User: {user_message}\nAssistant:"
+    # Instruct the model to be cautious about prescriptions
+    generation_input = full_prompt + "\nNote: Provide safe guidance and emphasize consulting a clinician. Keep reply concise."
+
+    # Generate
+    try:
+        gen = chat_pipe(generation_input, max_length=512, do_sample=True, temperature=0.7, top_p=0.9, num_return_sequences=1)[0]["generated_text"]
+        # The pipeline returns the whole text; extract assistant reply by removing the prompt prefix
+        reply = gen[len(generation_input):].strip()
+        # Some tokenizers return trailing incomplete bits; if empty, fallback:
+        if not reply:
+            reply = gen
+    except Exception as e:
+        reply = f"[generation error: {e}]"
+
+    # Add disclaimer at the end
+    reply = reply.strip()
+    if MEDICAL_DISCLAIMER not in reply:
+        reply = reply + "\n\n" + MEDICAL_DISCLAIMER
+
+    # Update history
+    if chat_history is None:
+        chat_history = []
+    chat_history.append([user_message, reply])
+    # Keep last 12 turns to limit memory
+    chat_history = chat_history[-12:]
+    return "", chat_history  # clear input box and return updated history
+
+# 9) Translation function using M2M100
+def translate_text(text, source_lang, target_lang):
+    """
+    source_lang and target_lang should be ISO language codes recognized by M2M100 (e.g., 'en', 'fr', 'hi', 'es')
+    """
+    # Set tokenizer language
+    try:
+        m2m_tokenizer.src_lang = source_lang
+        encoded = m2m_tokenizer(text, return_tensors="pt").to(m2m_model.device)
+        generated = m2m_model.generate(**encoded, forced_bos_token_id=m2m_tokenizer.get_lang_id(target_lang), max_length=512)
+        translated = m2m_tokenizer.batch_decode(generated, skip_special_tokens=True)[0]
+        return translated
+    except Exception as e:
+        return f"[translation error: {e}]"
+
+# 10) Image analysis: caption + quick Q&A via the chat model (image->caption, then optionally ask question)
+def analyze_image(image: Image.Image, question: str):
+    # BLIP caption
+    if image is None:
+        return "No image provided.", ""
+    device_for_blip = next(blip_model.parameters()).device
+    inputs = blip_processor(images=image, return_tensors="pt").to(device_for_blip)
+    out = blip_model.generate(**inputs, max_new_tokens=128)
+    caption = blip_processor.decode(out[0], skip_special_tokens=True)
+    # If user asked a question, piggyback to chat model by giving caption + question
+    if question and question.strip():
+        prompt = SYSTEM_PROMPT + "\n\n"
+        prompt += f"Image caption: {caption}\nUser question: {question}\nAssistant:"
+        try:
+            gen = chat_pipe(prompt, max_length=512, do_sample=True, temperature=0.6, top_p=0.9, num_return_sequences=1)[0]["generated_text"]
+            # Strip prompt prefix
+            answer = gen[len(prompt):].strip()
+            if not answer:
+                answer = gen
+        except Exception as e:
+            answer = f"[generation error: {e}]"
+        answer = answer + "\n\n" + MEDICAL_DISCLAIMER
+    else:
+        answer = ""
+    return caption, answer
+
+# 11) Build Gradio interface
+with gr.Blocks(title="AI medical assistant (chat + translation + image analysis)") as demo:
+    gr.Markdown("## AI medical assistant — Chat / Translate / Image Analysis\n"
+                "- Chatbot uses the requested IBM Granite model (fallback to smaller model if not available).\n"
+                "- Translation uses `facebook/m2m100_418M`.\n"
+                "- Image analysis uses BLIP captioning + optional question answering.\n\n"
+                "**Disclaimer:** This app is for demonstration and educational purposes. Not a substitute for professional medical advice.")
+    with gr.Tab("Chatbot"):
+        chat_state = gr.State([])  # list of [user, assistant]
+        with gr.Row():
+            txt = gr.Textbox(label="Your message (medical context allowed)", placeholder="Describe symptoms, ask clinical questions...", lines=3)
+        chat_display = gr.Chatbot(label="Assistant")
+        send_btn = gr.Button("Send")
+        def _send(inp, state):
+            return chat_with_assistant(inp, state)
+        send_btn.click(_send, inputs=[txt, chat_state], outputs=[txt, chat_state])
+        # update chat display from state
+        def state_to_chat(state):
+            # reformat for Chatbot component: list of tuples
+            return [(u, a) for (u, a) in state]
+        gr.Button("Refresh chat display").click(state_to_chat, inputs=[chat_state], outputs=[chat_display])
+
+    with gr.Tab("Language Translation"):
+        gr.Markdown("Translate text between languages (many language codes supported; examples: en, fr, es, hi, zh, ar).")
+        src = gr.Textbox(label="Source language code (e.g. en)", value="en")
+        tgt = gr.Textbox(label="Target language code (e.g. hi)", value="hi")
+        txt_in = gr.Textbox(label="Text to translate", lines=4, value="Hello, how are you?")
+        translate_btn = gr.Button("Translate")
+        txt_out = gr.Textbox(label="Translation", lines=4)
+        translate_btn.click(fn=translate_text, inputs=[txt_in, src, tgt], outputs=[txt_out])
+
+    with gr.Tab("Image Analysis"):
+        gr.Markdown("Upload an image. The model will caption it, and you may optionally ask a question about the image (medical context allowed).")
+        img_in = gr.Image(type="pil")
+        q_in = gr.Textbox(label="Optional question about the image (e.g., 'Do you see any rash?')", lines=2)
+        analyze_btn = gr.Button("Analyze")
+        cap_out = gr.Textbox(label="Image caption", lines=3)
+        ans_out = gr.Textbox(label="Model answer (if question asked)", lines=6)
+        analyze_btn.click(fn=analyze_image, inputs=[img_in, q_in], outputs=[cap_out, ans_out])
+
+    gr.Markdown("**Usage tips:** If models fail to load due to memory or token errors, try switching to a GPU runtime (Runtime → Change runtime type → GPU) "
+                "or ensure your Hugging Face token has access to the requested model.")
+
+# 12) Launch the interface
+demo.launch(share=False)
